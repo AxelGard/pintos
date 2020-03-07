@@ -4,6 +4,7 @@
 #include <debug.h>
 #include <list.h>
 #include <stdint.h>
+#include "threads/synch.h"
 
 #ifdef USERPROG
   #include "userprog/filelist.h"
@@ -84,6 +85,28 @@ typedef int tid_t;
    only because they are mutually exclusive: only a thread in the
    ready state is on the run queue, whereas only a thread in the
    blocked state is on a semaphore wait list. */
+
+extern struct semaphore io_sema;
+
+/* parent child relationship */
+struct parent_child {
+  struct thread *thread;
+  struct list_elem relation_elem;
+
+  struct parent_child *parent;
+  struct list children;
+
+  bool exited;
+  bool loaded;
+
+  int exit_status;
+  int alive_count;
+  tid_t tid;
+
+  struct lock alive_count_lock;
+  struct semaphore exit_sema;
+};
+
 struct thread
   {
     /* Owned by thread.c. */
@@ -93,6 +116,11 @@ struct thread
     uint8_t *stack;                     /* Saved stack pointer. */
     int priority;                       /* Priority. */
     int64_t wake_up_tick;
+
+    struct semaphore exec_sema;
+    struct semaphore wait_sema;
+    int tid_wait_child;
+    struct parent_child *relation;
 
     /* Shared between thread.c and synch.c. */
     struct list_elem elem;              /* List element. */
@@ -107,6 +135,8 @@ struct thread
     /* Owned by thread.c. */
     unsigned magic;                     /* Detects stack overflow. */
   };
+
+extern struct list sleep_list;
 
 /* If false (default), use round-robin scheduler.
    If true, use multi-level feedback queue scheduler.

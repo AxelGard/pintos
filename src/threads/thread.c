@@ -27,7 +27,7 @@
 static struct list ready_list;
 
 /* List of sleeping processes */
-static struct list sleep_list;
+struct list sleep_list;
 
 
 /* Idle thread. */
@@ -39,7 +39,7 @@ static struct thread *initial_thread;
 /* Lock used by allocate_tid(). */
 static struct lock tid_lock;
 
-static struct semaphore sleep_sema;
+struct semaphore io_sema;
 
 /* Stack frame for kernel_thread(). */
 struct kernel_thread_frame
@@ -94,17 +94,16 @@ thread_init (void)
   ASSERT (intr_get_level () == INTR_OFF);
 
   lock_init (&tid_lock);
-  sema_init (&sleep_sema, 1); // semaphore for thread sleep
+  sema_init (&io_sema, 1);
   list_init (&ready_list);
   list_init (&sleep_list);
+
 
   /* Set up a thread structure for the running thread. */
   initial_thread = running_thread ();
   init_thread (initial_thread, "main", PRI_DEFAULT);
   initial_thread->status = THREAD_RUNNING;
   initial_thread->tid = allocate_tid ();
-  //malloc((size_t) 3);
-  //initial_thread->file_list = (struct file*) malloc(128 * sizeof(struct file*));
 }
 
 /* Starts preemptive thread scheduling by enabling interrupts.
@@ -115,6 +114,7 @@ thread_start (void)
   /* Create the idle thread. */
   struct semaphore idle_started;
   sema_init (&idle_started, 0);
+
   thread_create ("idle", PRI_MIN, idle, &idle_started);
 
   /* Start preemptive thread scheduling. */
@@ -135,23 +135,11 @@ thread_tick (void)
   if (t == idle_thread)
     idle_ticks++;
 #ifdef USERPROG
-  else if (t->pagedirt->wake_up_tick != NULL)
+  else if (t->pagedir != NULL)
     user_ticks++;
 #endif
   else
     kernel_ticks++;
-
-  ASSERT (intr_get_level() == INTR_OFF);
-  while (list_begin(&sleep_list)!=list_end(&sleep_list)) {
-      struct thread *t = (struct thread*) list_entry(list_begin(&sleep_list), struct thread, sleep_list_elem);
-      if (t->wake_up_tick <= timer_ticks()){
-        thread_unblock(t);
-        list_pop_front(&sleep_list);
-      } else {
-        break;
-      }
-  }
-
 
   /* Enforce preemption. */
   if (++thread_ticks >= TIME_SLICE)
@@ -308,6 +296,8 @@ thread_exit (void)
   process_exit ();
 #endif
 
+
+
   /* Just set our status to dying and schedule another process.
      We will be destroyed during the call to schedule_tail(). */
   intr_disable ();
@@ -344,11 +334,8 @@ thread_sleep (int64_t wake_up_tick){
   struct thread *cur = thread_current ();
   cur->wake_up_tick = wake_up_tick;
 
-  sema_down(&sleep_sema);
-  list_insert_ordered(&sleep_list, &cur->sleep_list_elem, wake_up_tick_cmp, NULL);
-  sema_up(&sleep_sema);
-
   enum intr_level old_level = intr_disable();
+  list_insert_ordered(&sleep_list, &cur->sleep_list_elem, wake_up_tick_cmp, NULL);
   thread_block();
   intr_set_level (old_level);
 }
@@ -484,6 +471,8 @@ init_thread (struct thread *t, const char *name, int priority)
   t->priority = priority;
   t->magic = THREAD_MAGIC;
   t->wake_up_tick = 0;
+  t->tid_wait_child = -1;
+  t->relation = NULL;
 }
 
 /* Allocates a SIZE-byte frame at the top of thread T's stack and

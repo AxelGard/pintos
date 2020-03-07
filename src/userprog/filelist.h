@@ -7,8 +7,8 @@
 #define OFFSET 2
 
 struct file_list {
-  struct file* files;
-  int look_from; // allways 0 for now
+  struct file** files;
+  int look_from;
 };
 
 int insert(struct file_list* list, struct file* file);

@@ -17,54 +17,112 @@
 #include "threads/palloc.h"
 #include "threads/thread.h"
 #include "threads/vaddr.h"
+#include "threads/synch.h"
 
 static thread_func start_process NO_RETURN;
-static bool load (const char *cmdline, void (**eip) (void), void **esp);
+static bool load (char *cmdline, void (**eip) (void), void **esp);
 
 /* Starts a new thread running a user program loaded from
    FILENAME.  The new thread may be scheduled (and may even exit)
    before process_execute() returns.  Returns the new process's
    thread id, or TID_ERROR if the thread cannot be created. */
 tid_t
-process_execute (const char *file_name)
-{
-  char *fn_copy;
+process_execute (const char *cmdline){
+  char *cmdline_copy;
   tid_t tid;
+
+  struct thread *t = thread_current();
+  sema_init (&t->exec_sema, 0);
+  sema_init (&t->wait_sema, 0);
+
+  if (t->relation == NULL){
+    struct parent_child *relation = malloc(sizeof(*relation));
+    t->relation = relation;
+    t->relation->exited = false;
+    t->relation->loaded = false;
+    t->relation->exit_status = 0;
+    t->relation->tid = t->tid;
+    t->relation->thread = t;
+    t->relation->parent = NULL;
+
+    lock_init(&t->relation->alive_count_lock);
+    sema_init(&t->relation->exit_sema, 0);
+
+    list_init(&t->relation->children);
+  }
 
   /* Make a copy of FILE_NAME.
      Otherwise there's a race between the caller and load(). */
-  fn_copy = palloc_get_page (0);
-  if (fn_copy == NULL)
+  cmdline_copy = palloc_get_page (0);
+  if (cmdline_copy == NULL)
     return TID_ERROR;
-  strlcpy (fn_copy, file_name, PGSIZE);
+
+  strlcpy (cmdline_copy, cmdline, PGSIZE);
+  struct execute_params *params = (struct execute_params*) malloc(sizeof(*params));
+  params->cmdline = cmdline_copy;
+  params->parent = t;
 
   /* Create a new thread to execute FILE_NAME. */
-  tid = thread_create (file_name, PRI_DEFAULT, start_process, fn_copy);
+  tid = thread_create (cmdline, PRI_DEFAULT, start_process, params);
   if (tid == TID_ERROR)
-    palloc_free_page (fn_copy);
-  return tid;
+    palloc_free_page (cmdline_copy);
+
+  sema_down(&t->exec_sema);
+  struct parent_child *relation = list_entry (list_begin(&t->relation->children), struct parent_child, relation_elem);
+  return (relation->loaded == true ? tid : -1);
 }
 
 /* A thread function that loads a user process and starts it
    running. */
 static void
-start_process (void *file_name_)
-{
-  char *file_name = file_name_;
+start_process (void *params_) {
+  struct execute_params *params = (struct execute_params*) params_;
+  char *cmdline = params->cmdline;
   struct intr_frame if_;
   bool success;
+
+  struct thread *t = thread_current();
+
+  struct parent_child *relation = malloc(sizeof(*relation));
+  t->relation = relation;
+  t->relation->exited = false;
+  t->relation->loaded = false;
+  t->relation->exit_status = 0;
+  t->relation->tid = t->tid;
+  t->relation->thread = t;
+  t->relation->parent = NULL;
+
+  lock_init(&t->relation->alive_count_lock);
+  sema_init(&t->relation->exit_sema, 0);
+
+  list_init(&t->relation->children);
+
+  t->relation->parent = params->parent->relation;
+  list_push_front(&t->relation->parent->children, &t->relation->relation_elem);
+
+  lock_acquire(&t->relation->parent->alive_count_lock);
+  t->relation->parent->alive_count++;
+  lock_release(&t->relation->parent->alive_count_lock);
 
   /* Initialize interrupt frame and load executable. */
   memset (&if_, 0, sizeof if_);
   if_.gs = if_.fs = if_.es = if_.ds = if_.ss = SEL_UDSEG;
   if_.cs = SEL_UCSEG;
   if_.eflags = FLAG_IF | FLAG_MBS;
-  success = load (file_name, &if_.eip, &if_.esp);
+  success = load (cmdline, &if_.eip, &if_.esp);
+  t->relation->loaded = success;
+  sema_up(&params->parent->exec_sema);
+
+  free(params); // free param passing struct
 
   /* If load failed, quit. */
-  palloc_free_page (file_name);
-  if (!success)
+  palloc_free_page (cmdline);
+  if (!success) {
+    t->relation->exit_status = -1;
     thread_exit ();
+  }
+
+
 
   /* Start the user process by simulating a return from an
      interrupt, implemented by intr_exit (in
@@ -86,18 +144,77 @@ start_process (void *file_name_)
    This function will be implemented in problem 2-2.  For now, it
    does nothing. */
 int
-process_wait (tid_t child_tid UNUSED)
-{
-  while (1 == 1) {}
-  return -1;
+process_wait (tid_t child_tid) {
+  struct thread *t = thread_current();
+  struct parent_child *child = NULL;
+  int exit_status = -1;
+
+  if (t->tid_wait_child == child_tid) return exit_status;
+
+  for (struct list_elem *e = list_begin(&t->relation->children); e != list_end(&t->relation->children); e = list_next(e)){
+    child = list_entry (e, struct parent_child, relation_elem);
+
+    if (child->tid == child_tid) {
+      list_remove(e);
+      if (child->exited) {
+        exit_status = child->exit_status;
+        free(child);
+        return exit_status;
+      }
+      break;
+    }
+  }
+
+  if (child == NULL) return exit_status;
+  t->tid_wait_child = child->tid;
+  sema_down(&t->wait_sema);
+  exit_status = child->exit_status;
+  free(child);
+  return exit_status;
 }
 
 /* Free the current process's resources. */
 void
-process_exit (void)
-{
+process_exit (void) {
   struct thread *cur = thread_current ();
+
+  if (cur->tid == 1) { // Have main thread loop forever
+    while(true){}
+  }
+
   uint32_t *pd;
+  lock_acquire(&cur->relation->parent->alive_count_lock);
+  cur->relation->parent->alive_count--;
+  lock_release(&cur->relation->parent->alive_count_lock);
+  lock_acquire(&cur->relation->alive_count_lock);
+  cur->relation->alive_count--;
+  lock_release(&cur->relation->alive_count_lock);
+  cur->relation->exited = true;
+
+  printf("%s: exit(%d)\n", cur->name, cur->relation->exit_status);
+
+  if (cur->tid == cur->relation->parent->thread->tid_wait_child){
+    cur->relation->parent->thread->tid_wait_child = -1;
+    sema_up(&cur->relation->parent->thread->wait_sema);
+  }
+
+  // If childs are alive, wait for them to exit
+  if (cur->relation->alive_count > 0) {
+    sema_down(&cur->relation->exit_sema);
+  }
+
+  // If last child to exit, tell parent to stop waiting
+  if (cur->relation->parent->alive_count == 0){
+    sema_up(&cur->relation->parent->exit_sema);
+  }
+
+  if (cur->relation->alive_count == 0){
+    while (!list_empty (&cur->relation->children)) {
+      struct list_elem *e = list_pop_front (&cur->relation->children);
+      struct parent_child *p = list_entry (e, struct parent_child, relation_elem);
+      free(p);
+    }
+  }
 
   /* Destroy the current process's page directory and switch back
      to the kernel-only page directory. */
@@ -207,14 +324,16 @@ static bool load_segment (struct file *file, off_t ofs, uint8_t *upage,
    and its initial stack pointer into *ESP.
    Returns true if successful, false otherwise. */
 bool
-load (const char *file_name, void (**eip) (void), void **esp)
+load (char *cmdline, void (**eip) (void), void **esp)
 {
   struct thread *t = thread_current ();
   struct Elf32_Ehdr ehdr;
   struct file *file = NULL;
   off_t file_ofs;
   bool success = false;
+  char *file_name = NULL;
   int i;
+  int j;
 
   /* Allocate and activate page directory. */
   t->pagedir = pagedir_create ();
@@ -226,6 +345,57 @@ load (const char *file_name, void (**eip) (void), void **esp)
   if (!setup_stack (esp)){
     goto done;
   }
+
+  int argc = 1;
+  char** argv = NULL;
+
+  // calculate argc
+  int last_space_pos = 0;
+  for (j = 0; cmdline[j]; j++){
+    if (cmdline[j] == ' ') {
+      if (j == last_space_pos + 1){
+        last_space_pos = j;
+        break;
+      }
+      last_space_pos = j;
+      argc++;
+    }
+  }
+
+  //printf("argc == %d\n", argc);
+
+  ASSERT(argc <= 32);
+
+  // copy cmdline to stack
+  *esp -= strlen(cmdline) + 1;
+  strlcpy(*esp, cmdline, strlen(cmdline) + 1);
+  char* arg_ptr = *esp;
+
+  // adjust esp so it is divisible by 4 and find argv position
+  *esp -= (uintptr_t)*esp % 4;
+  *esp -= sizeof(char*) * (argc + 1);
+  argv = (char**)*esp;
+
+  // Split cmdline into arguments and put each into argv[j]
+  char* save_ptr;
+  j = 0;
+  for (char *token = strtok_r(arg_ptr, " ", &save_ptr); token != NULL; token = strtok_r(NULL, " ", &save_ptr)){
+    argv[j] = token;
+    j++;
+  }
+  argv[j] = NULL;
+
+  // Insert argv, argc and return address
+  *esp -= sizeof(char*);
+  **(char****)esp = argv;
+  *esp -= sizeof(argv);
+  **(int**)esp = argc;
+  *esp -= sizeof(argc);
+  **(void***)esp = NULL; // return address
+
+  file_name = argv[0];
+  // set thread->name to correct string (file_name)
+  strlcpy (thread_current()->name, file_name, sizeof thread_current()->name);
 
    /* Uncomment the following line to print some debug
      information. This will be useful when you debug the program
@@ -477,10 +647,11 @@ setup_stack (void **esp)
     {
       success = install_page (((uint8_t *) PHYS_BASE) - PGSIZE, kpage, true);
       if (success)
-        *esp = PHYS_BASE - 12;
+        *esp = PHYS_BASE;
       else
         palloc_free_page (kpage);
     }
+
   return success;
 }
 
