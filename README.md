@@ -1,5 +1,5 @@
 # pintos
-this is a pintos linux core that we workt with in corse TDDB68, orginal code is from stanford pintos 
+this is a pintos linux core that we workt with in corse [TDDB68](https://www.ida.liu.se/~TDDB68/), orginal code is from stanford pintos 
 
 some of the code was not written by me 
 a major part of the code was writen by Stanford.edu and some by LiU 
