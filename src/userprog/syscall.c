@@ -146,18 +146,22 @@ int execute(char *cmdline){
 void seek(int fd, unsigned position){
   struct file_list *file_list = thread_current()->file_list;
   struct file *file = get(file_list, fd);
+  if (file == NULL) return;
+  if (position >= file_length(file)) position = file_length(file) - 1;
   file_seek(file, position);
 }
 
 unsigned tell(int fd){
   struct file_list *file_list = thread_current()->file_list;
   struct file *file = get(file_list, fd);
+  if (file == NULL) return -1;
   return file_tell(file);
 }
 
 int filesize(int fd){
   struct file_list *file_list = thread_current()->file_list;
   struct file *file = get(file_list, fd);
+  if (file == NULL) return -1;
   return file_length(file);
 }
 
